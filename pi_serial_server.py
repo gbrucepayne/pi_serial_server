@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-Simple Serial to Network (TCP/IP) re-director aka Serial Server.
+Simple Serial to Network (TCP/IP) re-director aka Serial Server for use with Raspberry Pi.
 Forwards data between a COM port and a TCP port, in both directions.
 
 """
