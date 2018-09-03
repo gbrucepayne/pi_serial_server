@@ -4,7 +4,9 @@
 Simple Serial to Network (TCP/IP) re-director aka Serial Server for use with Raspberry Pi.
 Forwards data between a local COM port and a remote TCP (client) port, in both directions.
 
-Supports logging to a file with timestamped details and verbose debug output.
+Runs from Command Line Interface.
+
+Supports optional logging to a file with (UTC) timestamped details and verbose debug output.
 
 .. note::
     You may need to increase read/write timeouts on the attached serial device to accommodate
@@ -41,13 +43,15 @@ class SerialServer:
     """
     The serial server.
 
+    .. _pySerial: https://pyserial.readthedocs.io
+
     :param port: (string) optional name of the serial/COM port to use (default /dev/ttyUSB0)
     :param baudrate: (integer) communication rate of the serial port (default 9600)
-    :param bytesize: (enum) from `pySerial <https://pyserial.readthedocs.io/en/latest/pyserial_api.html>`_
-    :param parity: (enum) from `pySerial <https://pyserial.readthedocs.io/en/latest/pyserial_api.html>`_
-    :param stopbits: (enum) from `pySerial <https://pyserial.readthedocs.io/en/latest/pyserial_api.html>`_
+    :param bytesize: (enum) see pySerial_
+    :param parity: (enum) see pySerial_
+    :param stopbits: (enum) see pySerial_
     :param rtscts: (Boolean) use Request To Send / Clear To Send flow control on serial port
-    :param xonxoff: (Boolean) use XON/XOFF flow control on serial port
+    :param xonxoff: (Boolean) use XON / XOFF flow control on serial port
     :param dsrdtr: (Boolean) use Data Set Ready / Data Terminal Ready flow control on serial port
     :param timeout: (float) seconds
     :param write_timeout: (float) seconds
@@ -89,7 +93,10 @@ class SerialServer:
             self.log = get_log_wrap()
 
     def start(self):
-        """Opens the serial port and TCP listener to being forwarding data."""
+        """
+        Opens the serial port and TCP listener to begin forwarding data.
+        Waits until a TCP client connects on the specified port, before creating a read and write thread.
+        """
         self.alive = True
         try:
             self.ser.open()
@@ -264,75 +271,76 @@ def get_log_wrap(filename=None, filesize=5, debug=False):
     return log_object
 
 
-def parse_args(argv):
+def get_parser():
     """
-    Parses the command line arguments.
+    Creates the command line arguments.
 
-    :param argv: An array containing the command line arguments
-    :returns: A dictionary containing the command line arguments and their values
+    :returns: An argparse.ArgumentParser
 
     """
     parser = argparse.ArgumentParser(description="Converts TCP/IP to serial.")
 
-    parser.add_argument('--debug', action='store_true',
-                        help="enable verbose debug logging")
-
-    parser.add_argument('-l', '--logfile', dest='filename', default=None,
-                        help="an output log file name (optional)")
-
-    parser.add_argument('-s', '--logsize', dest='filesize', type=int, default=5,
-                        help="the maximum log file size, in MB (default 5 MB)")
+    parser.add_argument('--tcp', default=9001, type=int, choices=range(1024, 65535),
+                        help="TCP/IP host port to listen on (``int`` default 9001)", metavar="{1024..65535}")
 
     parser.add_argument('-p', '--port', default='/dev/ttyUSB0',
-                        help="name of the serial port (default /dev/ttyUSB0)")
+                        help="name of the serial port (``string`` default /dev/ttyUSB0)")
 
     parser.add_argument('-b', '--baud', default=9600, type=int,
                         choices=[2400, 4800, 9600, 19200, 38400, 57600, 115200],
-                        help="baud rate (default 9600)", metavar="(2400..155200)")
+                        help="baud rate (``int`` default 9600)", metavar="{2400..115200}")
 
-    parser.add_argument('-r', '--rtscts', action='store_true',
+    parser.add_argument('--rtscts', action='store_true',
                         help="use RTS/CTS flow control (default disabled)")
 
-    parser.add_argument('-x', '--xonxoff', action='store_true',
+    parser.add_argument('--xonxoff', action='store_true',
                         help="use XON/XOFF flow control (default disabled)")
 
-    parser.add_argument('-d', '--dsrdtr', action='store_true',
+    parser.add_argument('--dsrdtr', action='store_true',
                         help="use DSR/DTR flow control (default disabled)")
 
-    parser.add_argument('-t', '--tcp_port', default=9001, type=int, choices=range(1024, 65535),
-                        help="TCP/IP Host port (default 9001)", metavar="(1024..65535)")
+    parser.add_argument('-t', '--timeout', default=1.0, type=float, choices=range(0, 60),
+                        help="serial read/write timeouts (``float`` default 1.0 seconds)", metavar="{0..60}")
 
-    parser.add_argument('--delay', default=1, type=float, choices=range(0, 60),
-                        help="TCP/IP network delay (default 1.0 seconds)", metavar="(0..60)")
+    parser.add_argument('--logfile', dest='filename', default=None,
+                        help="an output log file name (optional ``string``)")
 
-    return vars(parser.parse_args(args=argv[1:]))
+    parser.add_argument('--logsize', dest='filesize', type=int, default=5,
+                        help="the maximum log file size, in MB (``int`` default 5 MB)")
+
+    parser.add_argument('--debug', action='store_true',
+                        help="enable verbose debug logging")
+
+    return parser
 
 
 def main():
-    user_options = parse_args(sys.argv)
+    """Gets user inputs and starts the server until keyboard interrupt"""
+    parser = get_parser()
+    user_options = parser.parse_args()
 
     # logger setup
-    if user_options['filename'] is not None and user_options['filename'].split('.')[1] != '.log':
-        user_options['filename'] = user_options['filename'] + '.log'
-    log = get_log_wrap(filename=user_options['filename'], filesize=user_options['filesize'],
-                       debug=user_options['debug'])
+    if user_options.filename is not None and user_options.filename.split('.')[1] != '.log':
+        user_options.filename = user_options.filename + '.log'
+    log = get_log_wrap(filename=user_options.filename, filesize=user_options.filesize,
+                       debug=user_options.debug)
 
     log.info("***** Starting: RPi Serial <--> TCP/IP port server (type Ctrl-C / BREAK to quit) *****")
     # log.debug("PySerial version {version}".format(version=serial.__version__))
 
-    if not validate_serial_port(user_options['port'], log):
-        log.error("No available serial port matching {port}".format(port=user_options['port']))
+    if not validate_serial_port(user_options.port, log):
+        log.error("No available serial port matching {port}".format(port=user_options.port))
         sys.exit(1)
     if serial.__version__ < 3.0:
-        log.error("Please update pySerial module from {version} to 3.0 or higher (sudo pip install serial --upgrade)"
+        log.error("Please update pySerial module from {version} to 3.0 or higher (e.g. pip install pyserial --upgrade)"
                   .format(version=serial.__version__))
         sys.exit(1)
 
     # TODO: allow for settings other than 8N1 with inter_byte_timeout ``None``
-    server = SerialServer(port=user_options['port'], baudrate=user_options['baud'],
-                          rtscts=user_options['rtscts'], xonxoff=user_options['xonxoff'],
-                          timeout=user_options['delay'], write_timeout=user_options['delay'],
-                          tcp_port=user_options['tcp_port'],
+    server = SerialServer(port=user_options.port, baudrate=user_options.baud,
+                          rtscts=user_options.rtscts, xonxoff=user_options.xonxoff,
+                          timeout=user_options.timeout, write_timeout=user_options.timeout,
+                          tcp_port=user_options.tcp,
                           log=log)
 
     try:
