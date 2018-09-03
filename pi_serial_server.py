@@ -2,7 +2,17 @@
 
 """
 Simple Serial to Network (TCP/IP) re-director aka Serial Server for use with Raspberry Pi.
-Forwards data between a COM port and a TCP port, in both directions.
+Forwards data between a local COM port and a remote TCP (client) port, in both directions.
+
+Supports logging to a file with timestamped details and verbose debug output.
+
+.. note::
+    You may need to increase read/write timeouts on the attached serial device to accommodate
+    network delays.
+
+.. tip::
+    Windows Users can use a virtual serial port driver like `HW Group Virtual Serial Port
+    <https://www.hw-group.com/software/hw-vsp3-virtual-serial-port>`_
 
 """
 
@@ -15,9 +25,13 @@ import argparse
 import socket
 import logging
 from logging.handlers import RotatingFileHandler
+import binascii
+import string
 
 try:
+    # TODO: requires pySerial version 3.0 or higher
     import serial
+    import serial.tools.list_ports
 except ImportError:
     print "Running serial_tcp_redirect requires pyserial"
     sys.exit(1)
@@ -29,18 +43,25 @@ class SerialServer:
 
     :param port: (string) optional name of the serial/COM port to use (default /dev/ttyUSB0)
     :param baudrate: (integer) communication rate of the serial port (default 9600)
-    :param rtscts: (Boolean) use Ready To Send / Clear To Send flow control on serial port
+    :param bytesize: (enum) from `pySerial <https://pyserial.readthedocs.io/en/latest/pyserial_api.html>`_
+    :param parity: (enum) from `pySerial <https://pyserial.readthedocs.io/en/latest/pyserial_api.html>`_
+    :param stopbits: (enum) from `pySerial <https://pyserial.readthedocs.io/en/latest/pyserial_api.html>`_
+    :param rtscts: (Boolean) use Request To Send / Clear To Send flow control on serial port
     :param xonxoff: (Boolean) use XON/XOFF flow control on serial port
-    :param dsrdtr: (Boolean) use Data Se
-    :param timeout: (integer) seconds
-    :param writeTimeout: (integer)
+    :param dsrdtr: (Boolean) use Data Set Ready / Data Terminal Ready flow control on serial port
+    :param timeout: (float) seconds
+    :param write_timeout: (float) seconds
+    :param inter_byte_timeout: (float) seconds or None (default)
     :param tcp_port: (integer) the TCP port to listen for remote connections (default 9001)
+    :param log: optional logging object
 
     """
     def __init__(self, port, baudrate=9600,
+                 bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
                  rtscts=False, xonxoff=False, dsrdtr=False,
-                 timeout=1, writeTimeout=1,
-                 tcp_port=9001):
+                 timeout=1, write_timeout=1, inter_byte_timeout=None,
+                 tcp_port=9001,
+                 log=None):
         self.tcp_port = tcp_port
         self.socket = None
         self.conn = None
@@ -52,31 +73,42 @@ class SerialServer:
         self.ser = serial.Serial()
         self.ser.port = port
         self.ser.baudrate = baudrate
+        self.ser.bytesize = bytesize
+        self.ser.parity = parity
+        self.ser.stopbits = stopbits
         self.ser.timeout = timeout
-        self.ser.writeTimeout=writeTimeout
+        self.ser.write_timeout = write_timeout
+        self.ser.inter_byte_timeout = inter_byte_timeout
         self.ser.xonxoff = xonxoff
         self.ser.rtscts = rtscts
         self.ser.dsrdtr = dsrdtr
+        # logging
+        if log is not None:
+            self.log = log
+        else:
+            self.log = get_log_wrap()
 
     def start(self):
         """Opens the serial port and TCP listener to being forwarding data."""
         self.alive = True
         try:
             self.ser.open()
-            print("Serial connection open on {port}".format(port=self.ser.port))
+            self.log.info("Serial connection open on {port}".format(port=self.ser.port))
+            if self.ser.inter_byte_timeout is not None:
+                self.log.debug("  Serial inter-byte timeout {ibt} seconds".format(ibt=self.ser.inter_byte_timeout))
         except serial.SerialException, e:
-            print "Could not open serial {port} - {error}".format(port=self.ser.port, error=e)
+            self.log.error("Could not open serial {port} - {error}".format(port=self.ser.port, error=e))
             sys.exit(1)
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.bind(('', self.tcp_port))
             host = socket.gethostbyname(socket.gethostname())
             self.socket.listen(1)
-            print("Listening on {host}:{port}".format(host=host, port=self.tcp_port))
+            self.log.info("Listening on {host}:{port}".format(host=host, port=self.tcp_port))
             self.conn, addr = self.socket.accept()
-            print("TCP connection from {addr}".format(addr=addr))
+            self.log.info("TCP connection from {addr}".format(addr=addr))
         except socket.error, e:
-            print("Could not open socket: {error}".format(error=e))
+            self.log.error("Could not open socket: {error}".format(error=e))
             self.socket = None
             raise
         # start redirecting from tcp/ip to serial
@@ -87,38 +119,71 @@ class SerialServer:
         self.thread_read.setDaemon(True)
         self.thread_read.start()
 
+    def _printable(self, data):
+        """
+        Returns a printable string either ASCII text if all readable, or a hex string.
+
+        :param data: (bytes) to make printable
+        :return: printable string
+
+        """
+        printable = ''
+        all_printable = True
+        for b in data:
+            if b in string.printable and all_printable:
+                printable += str(b)
+            else:
+                if all_printable:
+                    all_printable = False
+                    if len(printable) > 0:
+                        self.log.debug("Must replace {num} chars from {s}".format(num=len(printable)/2, s=printable))
+                        non_printable = ''
+                        for c in printable:
+                            non_printable += c.encode('hex')
+                        printable = non_printable
+                printable += binascii.hexlify(b)
+        if all_printable and printable[len(printable) - 1] == '\n':
+            printable = printable.replace('\n', '')
+        else:
+            printable = printable.replace('\n', '0a')
+        return printable
+
     def _reader(self):
         """loop forever and copy serial->socket"""
-        print("Waiting for serial data on {port}".format(port=self.ser.port))
+        self.log.debug("Waiting for serial data on {port}".format(port=self.ser.port))
+        self.ser.reset_input_buffer()
         while self.alive:
             data = self.ser.read_until()
+            if self.ser.in_waiting > 0:
+                data += self.ser.read(self.ser.in_waiting)
             if data:
-                print("Serial data received: {data}".format(data=data))
+                self.log.debug("Serial data received: {data}".format(data=self._printable(data)))
                 if self.conn:
                     try:
                         self.conn.sendall(data)
                     except socket.error, e:
-                        print("Socket error: {error}".format(error=e))
+                        self.log.error("Socket error: {error}".format(error=e))
                         break
                 else:
-                    print("No TCP connection active, dropping data.")
-        print("Terminating from _reader.")
+                    self.log.warning("No TCP connection active, dropping data.")
+        self.log.debug("Terminating from _reader.")
         self._terminate()
 
     def _writer(self):
         """loop forever and copy socket->serial"""
+        self.ser.reset_output_buffer()
         while self.alive:
             try:
                 data = self.conn.recv(self.ip_read_size)
                 if not data:
                     break
                 else:
-                    print("Received TCP socket data {data}".format(data=data))
+                    self.log.debug("Received TCP socket data {data}".format(data=self._printable(data)))
                     self.ser.write(data)
             except socket.error, e:
-                print("Socket error: {error}".format(error=e))
+                self.log.error("Socket error: {error}".format(error=e))
                 break
-        print("Terminating from _writer.")
+        self.log.debug("Terminating from _writer.")
         self._terminate()
 
     def stop(self):
@@ -140,33 +205,57 @@ class SerialServer:
             self.ser.close()
 
 
-def init_log(logfile=None, file_size=5, debug=False):
+def validate_serial_port(target, log):
+    """
+    Validates a given serial port as available on the host.
+
+    :param target: (string) the target port name e.g. '/dev/ttyUSB0'
+    :param log: a logger object for debug/info logging
+    :return: (Boolean) validity
+
+    """
+    found = False
+    ser_ports = [tuple(port) for port in list(serial.tools.list_ports.comports())]
+    for port in ser_ports:
+        if 'USB VID:PID=0403:6001' in port[2] and target == port[0]:
+            log.info("Using serial FTDI FT232 (RS485/RS422/RS232) on {port}".format(port=port[0]))
+            found = True
+        elif 'USB VID:PID=067B:2303' in port[2] and target == port[0]:
+            log.info("Using serial Prolific PL2303 (RS232) on {port}".format(port=port[0]))
+            found = True
+        elif target == port[0]:
+            usb_id = str(port[2])
+            log.info("Using serial vendor/device {id} on {port}".format(id=usb_id, port=port[0]))
+            found = True
+    return found
+
+
+def get_log_wrap(filename=None, filesize=5, debug=False):
     """
     Initializes logging to file and console.
 
-    :param logfile: the name of the file
-    :param file_size: the max size of the file in megabytes, before wrapping occurs
-    :param debug: Boolean to enable verbose logging
-    :return: ``log`` object
+    :param filename: (string) the name of the file (None will just use a temporary log in memory)
+    :param filesize: (int) the max size of the file in megabytes, before wrapping occurs
+    :param debug: (Boolean) enables verbose logging
+    :return: logger object with custom formatting and handlers for console and file
 
     """
-    # TODO: move into imported module
     if debug:
         log_lvl = logging.DEBUG
     else:
         log_lvl = logging.INFO
-    log_formatter = logging.Formatter(fmt='%(asctime)s.%(msecs)03d,(%(threadName)-10s),' \
-                                          '[%(levelname)s],%(funcName)s(%(lineno)d),%(message)s',
-                                      datefmt='%Y-%m-%d %H:%M:%S')
+    log_formatter = logging.Formatter(fmt='%(asctime)s.%(msecs)03d,(%(threadName)-10s),'
+                                               '[%(levelname)s],%(funcName)s(%(lineno)d),%(message)s',
+                                           datefmt='%Y-%m-%d %H:%M:%S')
     log_formatter.converter = time.gmtime
-    if logfile is not None:
-        log_object = logging.getLogger(logfile)
-        log_handler = RotatingFileHandler(logfile, mode='a', maxBytes=file_size * 1024 * 1024,
+    if filename is not None:
+        log_object = logging.getLogger(filename)
+        log_handler = RotatingFileHandler(filename, mode='a', maxBytes=filesize * 1024 * 1024,
                                           backupCount=2, encoding=None, delay=0)
         log_handler.setFormatter(log_formatter)
         log_object.addHandler(log_handler)
     else:
-        log_object = logging.getLogger("temp_log")
+        log_object = logging.getLogger("pi_serial_server")
     log_object.setLevel(log_lvl)
     console = logging.StreamHandler()
     console.setFormatter(log_formatter)
@@ -185,65 +274,77 @@ def parse_args(argv):
     """
     parser = argparse.ArgumentParser(description="Converts TCP/IP to serial.")
 
-    # parser.add_argument('-l', '--log', dest='logfile', type=str, default='pi_serial_server.log',
-    #                     help="the log file name with optional extension (default extension .log)")
-    #
-    # parser.add_argument('-s', '--logsize', dest='log_size', type=int, default=5,
-    #                     help="the maximum log file size, in MB (default 5 MB)")
-    #
+    parser.add_argument('--debug', action='store_true',
+                        help="enable verbose debug logging")
 
-    parser.add_argument('-p', '--port', dest='port', default='/dev/ttyUSB0',
+    parser.add_argument('-l', '--logfile', dest='filename', default=None,
+                        help="an output log file name (optional)")
+
+    parser.add_argument('-s', '--logsize', dest='filesize', type=int, default=5,
+                        help="the maximum log file size, in MB (default 5 MB)")
+
+    parser.add_argument('-p', '--port', default='/dev/ttyUSB0',
                         help="name of the serial port (default /dev/ttyUSB0)")
 
-    parser.add_argument('-b', '--baud', dest='baud', default='9600',
-                        help="baud rate (default 9600)")
+    parser.add_argument('-b', '--baud', default=9600, type=int,
+                        choices=[2400, 4800, 9600, 19200, 38400, 57600, 115200],
+                        help="baud rate (default 9600)", metavar="(2400..155200)")
 
-    parser.add_argument('-r', '--rtscts', dest='rts_cts', action='store_true',
+    parser.add_argument('-r', '--rtscts', action='store_true',
                         help="use RTS/CTS flow control (default disabled)")
 
-    parser.add_argument('-x', '--xonxoff', dest='xon_xoff', action='store_true',
+    parser.add_argument('-x', '--xonxoff', action='store_true',
                         help="use XON/XOFF flow control (default disabled)")
 
-    parser.add_argument('-t', '--tcp', dest='tcp_port', default='9001',
-                        help="TCP/IP Host port (default 9001)")
+    parser.add_argument('-d', '--dsrdtr', action='store_true',
+                        help="use DSR/DTR flow control (default disabled)")
+
+    parser.add_argument('-t', '--tcp_port', default=9001, type=int, choices=range(1024, 65535),
+                        help="TCP/IP Host port (default 9001)", metavar="(1024..65535)")
+
+    parser.add_argument('--delay', default=1, type=float, choices=range(0, 60),
+                        help="TCP/IP network delay (default 1.0 seconds)", metavar="(0..60)")
 
     return vars(parser.parse_args(args=argv[1:]))
 
 
 def main():
-    # parse command line options
     user_options = parse_args(sys.argv)
-    if user_options['baud'] not in ('2400', '4800', '9600', '19200', '38400', '57600', '115200'):
-        print("Invalid baud rate, using 9600 (default).")
-        user_options['baud'] = 9600
-    else:
-        user_options['baud'] = int(user_options['baud'])
-    # TODO: validate serial port exists
 
-    try:
-        user_options['tcp_port'] = int(user_options['tcp_port'])
-        # TODO: validate port range
-    except ValueError:
-        # raise ValueError, "TCP port must be a valid integer number in the range (X..Y)"
-        print("Invalid TCP port, using 9001 (default)")
-        user_options['tcp_port'] = 9001
+    # logger setup
+    if user_options['filename'] is not None and user_options['filename'].split('.')[1] != '.log':
+        user_options['filename'] = user_options['filename'] + '.log'
+    log = get_log_wrap(filename=user_options['filename'], filesize=user_options['filesize'],
+                       debug=user_options['debug'])
 
+    log.info("***** Starting: RPi Serial <--> TCP/IP port server (type Ctrl-C / BREAK to quit) *****")
+    # log.debug("PySerial version {version}".format(version=serial.__version__))
+
+    if not validate_serial_port(user_options['port'], log):
+        log.error("No available serial port matching {port}".format(port=user_options['port']))
+        sys.exit(1)
+    if serial.__version__ < 3.0:
+        log.error("Please update pySerial module from {version} to 3.0 or higher (sudo pip install serial --upgrade)"
+                  .format(version=serial.__version__))
+        sys.exit(1)
+
+    # TODO: allow for settings other than 8N1 with inter_byte_timeout ``None``
     server = SerialServer(port=user_options['port'], baudrate=user_options['baud'],
-                          rtscts=user_options['rts_cts'], xonxoff=user_options['xon_xoff'],
-                          timeout=1, writeTimeout=0,
-                          tcp_port=user_options['tcp_port'])
+                          rtscts=user_options['rtscts'], xonxoff=user_options['xonxoff'],
+                          timeout=user_options['delay'], write_timeout=user_options['delay'],
+                          tcp_port=user_options['tcp_port'],
+                          log=log)
 
     try:
-        print "***** RPi Serial <--> TCP/IP port server (type Ctrl-C / BREAK to quit) *****"
         server.start()
         while True:
             pass
 
     except KeyboardInterrupt:
-        print("Execution halted by user.")
+        log.info("Execution halted by user.")
 
     except Exception, e:
-        print("Error {error}".format(error=e))
+        log.error("Error {error}".format(error=e))
 
     finally:
         server.stop()
